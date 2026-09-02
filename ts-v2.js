@@ -46,6 +46,7 @@
 
     if (!window.Lampa || !Lampa.Utils) return;
 
+    var VERSION = '2.1';
     var DASH = '—';
     var HIDDEN = 'ts-v2-hidden';
 
@@ -171,6 +172,26 @@
 
     function isPack(t) { return typeof t === 'string' && PACK_RE.test(t); }
 
+    // Structural markers that separate the show name from the episode part:
+    // S01, S01E05, S6E11, 1x05, Season 1, Сезон 2.
+    var MARKER_RE = /^(s\d{1,2}(e\d{1,3})?|\d{1,2}x\d{1,3}|seasons?|сезон)$/i;
+
+    // Tokens of the primary show title: everything before the first marker, with
+    // any leading markers stripped first so "[S01] Breaking Bad" still works.
+    // Returns [] when the release carries no marker at all - then the caller
+    // keeps its normal whole-title matching.
+    function showTitle(title) {
+        var tk = tokens(title);
+        var i = 0;
+        while (i < tk.length && (MARKER_RE.test(tk[i]) || /^\d{1,2}$/.test(tk[i]) && i > 0 && MARKER_RE.test(tk[i - 1]))) i++;
+        var head = [];
+        for (var j = i; j < tk.length; j++) {
+            if (MARKER_RE.test(tk[j])) return head;
+            head.push(tk[j]);
+        }
+        return [];
+    }
+
     // ============================================================ card / target
 
     function activeMovie() {
@@ -199,9 +220,31 @@
         return list;
     }
 
+    // Many localized titles keep the Latin name in front of a separator, e.g.
+    //   "Solo Leveling: Поднятие уровня в одиночку"
+    // Take that leading Latin part when it is a meaningful phrase. This is an
+    // extraction from metadata the card already holds - never a transliteration.
+    function latinPrefix(s) {
+        if (!s) return '';
+        var head = String(s).split(/[:\-–—\/|(\[]/)[0];
+        if (!head) return '';
+        head = head.replace(/\s+/g, ' ').trim();
+        if (head.length < 4) return '';                 // reject "S", "A", stray letters
+        if (latinShare(head) < 0.9) return '';          // the head itself must be Latin
+        var words = head.split(' ');
+        var real = 0;
+        for (var i = 0; i < words.length; i++) if (words[i].length >= 2) real++;
+        if (!real) return '';
+        // one very short word alone is not a meaningful title
+        if (real === 1 && head.replace(/[^A-Za-z]/g, '').length < 4) return '';
+        return head;
+    }
+
     // A Latin alias already present in the card - no extra request is made.
     function latinAlias(movie) {
         if (!movie) return '';
+
+        // 1-2. official alternative titles (Lampa already fetched them)
         var alt = movie.alternative_titles && movie.alternative_titles.titles;
         if (alt && alt.length) {
             for (var i = 0; i < alt.length; i++) {
@@ -212,10 +255,20 @@
                 if (latinShare(alt[k].title) > 0.6) return alt[k].title;
             }
         }
+
+        // 4. another already-Latin title field
         var pool = [movie.original_title, movie.original_name, movie.title, movie.name];
         for (var j = 0; j < pool.length; j++) {
             if (pool[j] && latinShare(pool[j]) > 0.6) return pool[j];
         }
+
+        // 3. meaningful Latin prefix of the display/localized title
+        for (var p = 0; p < pool.length; p++) {
+            var pre = latinPrefix(pool[p]);
+            if (pre) return pre;
+        }
+
+        // 5. nothing safe - leave the query alone
         return '';
     }
 
@@ -241,6 +294,34 @@
 
         var al = aliases(movie);
         if (!al.length) return true;
+
+        // For a series the show name comes first; whatever follows a season or
+        // episode marker is the episode title. Without this, an episode called
+        // "Breaking Bad" inside "Better Call Saul S06E11 Breaking Bad" matches
+        // the Breaking Bad card.
+        if (isSeries(movie)) {
+            var head = showTitle(title);
+            if (head.length) {
+                var best2 = 0;
+                for (var s = 0; s < al.length; s++) {
+                    var at = tokens(al[s]);
+                    if (!at.length) continue;
+                    // The head is already cut at the season/episode marker, so
+                    // matching anywhere inside it is strict enough: the episode
+                    // title that caused the false positive lives after the
+                    // marker. No positional window - releases legitimately put a
+                    // romaji or site prefix before the English show name, e.g.
+                    // "[Xspitfire911] Ore dake Level Up na Ken - Solo Leveling S01".
+                    var seen = {};
+                    for (var w = 0; w < head.length; w++) seen[head[w]] = 1;
+                    var n = 0;
+                    for (var q = 0; q < at.length; q++) if (seen[at[q]]) n++;
+                    var c2 = n / at.length;
+                    if (c2 > best2) best2 = c2;
+                }
+                if (best2 < 0.6) return false;
+            }
+        }
 
         var relTokens = tokens(title);
         if (!relTokens.length) return true;
@@ -362,6 +443,36 @@
         Lampa.Activity.__ts_v2 = true;
     }
 
+    // ============ safety net: the last point before the request leaves Lampa
+    //
+    // The torrents parser builds its request as
+    //   Utils.buildUrl(base_url, path, [{ name: 'query', value: params.search }])
+    // so this catches any path that reached the request with a still non-Latin
+    // query - for instance when the activity was created before this plugin
+    // loaded. Only the query value is touched; the URL is otherwise untouched.
+
+    if (Lampa.Utils.buildUrl && !Lampa.Utils.__ts_v2_url) {
+        var stockBuild = Lampa.Utils.buildUrl;
+
+        Lampa.Utils.buildUrl = function (base, path, args) {
+            try {
+                if (args && args.length) {
+                    for (var i = 0; i < args.length; i++) {
+                        if (args[i] && args[i].name === 'query' && typeof args[i].value === 'string') {
+                            if (latinShare(args[i].value) < 0.4) {
+                                var alias = latinAlias(activeMovie());
+                                if (alias) args[i].value = alias;
+                            }
+                        }
+                    }
+                }
+            } catch (e) {}
+            return stockBuild.apply(Lampa.Utils, arguments);
+        };
+
+        Lampa.Utils.__ts_v2_url = true;
+    }
+
     // ============================================ DOM fallback (safety net only)
 
     function fixItem(item) {
@@ -406,4 +517,10 @@
             scan(document.body);
         }
     }
+
+    // Version marker - no telemetry, just something to read off the console.
+    try {
+        window.__lampa_torrfix_version = VERSION;
+        if (window.console && console.log) console.log('[Lampa TorrFix] v' + VERSION + ' loaded');
+    } catch (e) {}
 })();
