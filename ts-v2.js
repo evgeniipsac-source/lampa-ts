@@ -46,7 +46,7 @@
 
     if (!window.Lampa || !Lampa.Utils) return;
 
-    var VERSION = '2.2';
+    var VERSION = '2.3';
     var DASH = '—';
     var HIDDEN = 'ts-v2-hidden';
 
@@ -632,17 +632,28 @@
                         else reason = 'non_latin_no_alias_found';
                     }
                     var mv = params.movie;
-                    journal('torrent_search_start', {
+                    searchId = rnd();
+                    searchStartedAt = Date.now();
+                    resultBuf = []; renderCount = 0;
+                    var ev = {
+                        session_id: SESSION, search_id: searchId,
                         id: mv.id,
                         media_type: mv.number_of_seasons ? 'tv' : 'movie',
+                        anime_like: (mv.original_language === 'ja' || mv.original_language === 'zh') ? true : undefined,
+                        title: mv.title || mv.name,
+                        original_title: mv.original_title || mv.original_name,
+                        original_language: mv.original_language,
                         requested_query: requested,
                         actual_query: params.search,
                         rewrite_reason: reason,
-                        original_language: mv.original_language,
                         year: (mv.release_date || mv.first_air_date || '').slice(0, 4),
                         season: params.season || null,
                         episode: params.episode || null
-                    });
+                    };
+                    var pc = parserContext();
+                    for (var pk in pc) ev[pk] = pc[pk];
+                    try { ev.active_filters = Lampa.Storage.get('torrents_filter', '{}'); } catch (e2) {}
+                    journal('torrent_search_start', ev);
                 }
             } catch (e) {}
             return stockPush.apply(Lampa.Activity, arguments);
@@ -774,28 +785,295 @@
 
     // ================================================================ journal taps
 
+    function rnd() { return Math.random().toString(36).slice(2, 10); }
+
+    var SESSION = rnd();
+    var searchId = '';
+    var playbackId = '';
+    var searchStartedAt = 0;
+
+    // Where the parser actually sends the query. Host and path only - any key,
+    // token or apikey in the URL is dropped, never logged.
+    function parserContext() {
+        var out = { parser_type: 'unknown', parser_host: '', parser_path: '', parser_mode: '', parser_use_link: '' };
+        try {
+            var t = Lampa.Storage.field('parser_torrent_type');
+            out.parser_type = t || 'unknown';
+            out.parser_use_link = Lampa.Storage.field('parser_use_link') || 'one';
+
+            if (t === 'jackett' || t === 'prowlarr') {
+                out.parser_mode = Lampa.Storage.field('jackett_interview') === 'healthy' ? 'status:healthy' : 'all';
+                var url = Lampa.Storage.field(t === 'jackett' ? 'jackett_url' : 'prowlarr_url') || '';
+                var m = String(url).match(/^(https?):\/\/([^\/?#]+)([^?#]*)/i);
+                if (m) {
+                    out.parser_protocol = m[1];
+                    // A URL may carry basic-auth credentials (user:pass@host).
+                    // Drop them - only the host itself is ever logged.
+                    var hostPart = m[2];
+                    var at = hostPart.lastIndexOf('@');
+                    if (at >= 0) { hostPart = hostPart.slice(at + 1); out.parser_userinfo = 'present-redacted'; }
+                    out.parser_host = hostPart;
+                    out.parser_path = m[3] || '/';
+                }
+                else if (url) { out.parser_host = '<unparsed>'; }
+            } else if (t === 'torrserver') {
+                out.parser_mode = 'torrserver';
+                var tu = Lampa.Storage.field(Lampa.Storage.field('torrserver_use_link') === 'two' ? 'torrserver_url_two' : 'torrserver_url') || '';
+                var m2 = String(tu).match(/^(https?):\/\/([^\/?#]+)([^?#]*)/i);
+                if (m2) {
+                    out.parser_protocol = m2[1];
+                    var hp = m2[2];
+                    var at2 = hp.lastIndexOf('@');
+                    if (at2 >= 0) { hp = hp.slice(at2 + 1); out.parser_userinfo = 'present-redacted'; }
+                    out.parser_host = hp;
+                    out.parser_path = m2[3] || '/';
+                }
+            }
+        } catch (e) {}
+        return out;
+    }
+
+    // ---- search result accumulation (from the 'torrent' render channel) -------
+
+    var resultBuf = [];
+    var renderCount = 0;
+    var endTimer = null;
+    var SNAPSHOT_N = 30;
+
+    function noteResult(item) {
+        renderCount++;
+        if (resultBuf.length < SNAPSHOT_N) {
+            var title = item.Title || item.title || '';
+            var tr = inferTracks(title);
+            resultBuf.push({
+                position: renderCount,
+                title: String(title).slice(0, 180),
+                source: item.Tracker || '',
+                infohash: (item.Hash || item.hash || '') || undefined,
+                size_bytes: isFinite(parseFloat(item.Size)) ? parseFloat(item.Size) : undefined,
+                size_raw: typeof item.size === 'string' ? item.size : undefined,
+                seeders: item.Seeders,
+                peers: item.Peers,
+                publish_date: item.PublishDate || undefined,
+                category: item.CategoryDesc || undefined,
+                pack_class: classify(title),
+                inferred_audio: tr.audio,
+                inferred_subtitles: tr.subs,
+                inferred_dub: tr.dub
+            });
+        }
+        if (endTimer) clearTimeout(endTimer);
+        endTimer = setTimeout(flushSearchEnd, 1500);      // list finished rendering
+    }
+
+    function flushSearchEnd() {
+        endTimer = null;
+        if (!searchId) return;
+        journal('search_results_snapshot', {
+            session_id: SESSION, search_id: searchId,
+            count: resultBuf.length, of_total: renderCount, results: resultBuf
+        });
+        journal('torrent_search_end', {
+            session_id: SESSION, search_id: searchId,
+            render_result_count: renderCount,
+            elapsed_ms: searchStartedAt ? (Date.now() - searchStartedAt) : undefined,
+            note: 'render_result_count is what Lampa actually drew; the parser raw count is not exposed to plugins'
+        });
+        resultBuf = []; renderCount = 0;
+    }
+
+    // ---- playback ------------------------------------------------------------
+
+    var pb = null;
+
+    function newPlayback(extra) {
+        playbackId = rnd();
+        pb = {
+            id: playbackId, opened_at: Date.now(), first_playing_at: 0,
+            buffering_count: 0, buffering_total: 0, buffering_at: 0,
+            min_ahead: null, last_sample: 0, watch_from: 0
+        };
+        if (extra) for (var k in extra) pb[k] = extra[k];
+        return pb;
+    }
+
+    function videoEl() {
+        try { return document.querySelector ? document.querySelector('video') : null; } catch (e) { return null; }
+    }
+
+    function bufferSample() {
+        if (!pb) return;
+        var v = videoEl();
+        if (!v || !v.duration || isNaN(v.duration)) return;      // native players expose no <video>
+        var end = 0;
+        try {
+            for (var i = 0; i < v.buffered.length; i++) {
+                if (v.buffered.start(i) <= v.currentTime && v.buffered.end(i) > end) end = v.buffered.end(i);
+            }
+        } catch (e) { return; }
+        var ahead = Math.max(0, end - v.currentTime);
+        if (pb.min_ahead === null || ahead < pb.min_ahead) pb.min_ahead = ahead;
+        journal('player_buffer_sample', {
+            session_id: SESSION, playback_id: pb.id,
+            current_time: Math.round(v.currentTime), duration: Math.round(v.duration),
+            buffered_end: Math.round(end), buffer_ahead_seconds: Math.round(ahead),
+            buffer_percent: Math.round(end / v.duration * 100)
+        });
+    }
+
+    function playbackSummary(reason) {
+        if (!pb) return;
+        var v = videoEl();
+        var watched = pb.first_playing_at ? Math.round((Date.now() - pb.first_playing_at) / 1000) : 0;
+        journal('playback_summary', {
+            session_id: SESSION, playback_id: pb.id, search_id: searchId, reason: reason,
+            total_watch_seconds: watched,
+            time_to_first_playing_ms: pb.first_playing_at ? (pb.first_playing_at - pb.opened_at) : undefined,
+            buffering_count: pb.buffering_count,
+            buffering_total_ms: pb.buffering_total,
+            min_buffer_ahead: pb.min_ahead === null ? undefined : Math.round(pb.min_ahead),
+            file_size: pb.file_size, infohash: pb.infohash,
+            duration: v && v.duration ? Math.round(v.duration) : undefined,
+            computed_bitrate_mbps: (pb.file_size && v && v.duration)
+                ? +(pb.file_size * 8 / 1000000 / v.duration).toFixed(2) : undefined
+        });
+        pb = null;
+    }
+
     try {
         jLoad();
+        journal('app_start', { session_id: SESSION, plugin_version: VERSION });
 
-        journal('app_start', { plugin_version: VERSION });
+        var L = Lampa.Listener;
 
-        if (Lampa.Listener && Lampa.Listener.follow) {
-            Lampa.Listener.follow('full', function (e) {
+        if (L && L.follow) {
+            L.follow('full', function (e) {
                 if (e && e.type === 'complite' && e.data && e.data.movie) {
                     var m = e.data.movie;
+                    var alt = (m.alternative_titles && m.alternative_titles.titles) || [];
+                    var altList = [];
+                    for (var i = 0; i < alt.length && i < 12; i++) {
+                        altList.push({ c: alt[i].iso_3166_1, t: String(alt[i].title).slice(0, 60) });
+                    }
                     journal('card_open', {
-                        id: m.id,
+                        session_id: SESSION, id: m.id,
                         media_type: m.number_of_seasons ? 'tv' : 'movie',
+                        anime_like: (m.original_language === 'ja' || m.original_language === 'zh') ? true : undefined,
                         title: m.title || m.name,
                         original_title: m.original_title || m.original_name,
                         original_language: m.original_language,
                         year: (m.release_date || m.first_air_date || '').slice(0, 4),
-                        runtime: m.runtime || 0
+                        runtime: m.runtime || 0,
+                        alternative_titles: altList,
+                        alternative_titles_count: alt.length
                     });
                 }
             });
 
-            Lampa.Listener.follow('activity', function () { setTimeout(hideShots, 300); });
+            L.follow('activity', function () { setTimeout(hideShots, 300); });
+
+            // torrent list: each rendered row, and the row the user picks
+            L.follow('torrent', function (e) {
+                try {
+                    if (!e || !e.element) return;
+                    if (e.type === 'render') noteResult(e.element);
+                    else if (e.type === 'onenter') {
+                        // Flush whatever the list produced even if the user picked
+                        // a row before the debounce fired.
+                        if (renderCount) {
+                            if (endTimer) { clearTimeout(endTimer); endTimer = null; }
+                            flushSearchEnd();
+                        }
+                        var it = e.element;
+                        var tr = inferTracks(it.Title || '');
+                        newPlayback({
+                            infohash: it.Hash || it.hash || undefined,
+                            file_size: isFinite(parseFloat(it.Size)) ? parseFloat(it.Size) : undefined
+                        });
+                        journal('torrent_selected', {
+                            session_id: SESSION, search_id: searchId, playback_id: playbackId,
+                            title: String(it.Title || '').slice(0, 180),
+                            source: it.Tracker, infohash: it.Hash || it.hash || undefined,
+                            size_bytes: isFinite(parseFloat(it.Size)) ? parseFloat(it.Size) : undefined,
+                            size_raw: it.size, seeders: it.Seeders, peers: it.Peers,
+                            pack_class: classify(it.Title || ''),
+                            inferred_audio: tr.audio, inferred_subtitles: tr.subs, inferred_dub: tr.dub
+                        });
+                    }
+                } catch (err) {}
+            });
+
+            // file list inside the torrent
+            L.follow('torrent_file', function (e) {
+                try {
+                    if (!e) return;
+                    if (e.type === 'list_open') {
+                        journal('file_list_ready', {
+                            session_id: SESSION, playback_id: playbackId,
+                            file_count: (e.items || []).length,
+                            elapsed_ms: pb ? (Date.now() - pb.opened_at) : undefined
+                        });
+                    } else if (e.type === 'onenter' && e.element) {
+                        if (pb && e.element.length) pb.file_size = e.element.length;
+                        journal('file_selected', {
+                            session_id: SESSION, playback_id: playbackId,
+                            path: String(e.element.path || '').slice(0, 200),
+                            file_size: e.element.length
+                        });
+                    }
+                } catch (err) {}
+            });
+        }
+
+        // player: real HTML5 semantics, documented per event
+        var PV = Lampa.PlayerVideo && Lampa.PlayerVideo.listener;
+        if (PV && PV.follow) {
+            PV.follow('canplay', function () {
+                if (!pb) newPlayback({});
+                if (!pb.opened_logged) {
+                    pb.opened_logged = true;
+                    journal('player_open', { session_id: SESSION, playback_id: pb.id, search_id: searchId, on: 'canplay' });
+                }
+            });
+            PV.follow('playing', function () {
+                if (!pb) return;
+                if (!pb.first_playing_at) {
+                    pb.first_playing_at = Date.now();
+                    journal('first_playing', {
+                        session_id: SESSION, playback_id: pb.id,
+                        elapsed_ms: pb.first_playing_at - pb.opened_at,
+                        semantic: 'HTML5 video "playing" event - playback actually started, not a decoded first frame'
+                    });
+                } else if (pb.buffering_at) {
+                    var d = Date.now() - pb.buffering_at;
+                    pb.buffering_at = 0; pb.buffering_total += d;
+                    journal('buffering_end', { session_id: SESSION, playback_id: pb.id, duration_ms: d });
+                }
+            });
+            PV.follow('waiting', function () {
+                if (!pb || !pb.first_playing_at || pb.buffering_at) return;   // initial load is not rebuffering
+                pb.buffering_at = Date.now(); pb.buffering_count++;
+                journal('buffering_start', { session_id: SESSION, playback_id: pb.id });
+            });
+            PV.follow('timeupdate', function () {
+                if (!pb) return;
+                var now = Date.now();
+                if (now - pb.last_sample < 5000) return;                      // at most once per 5 s
+                pb.last_sample = now;
+                bufferSample();
+            });
+            PV.follow('ended', function () { playbackSummary('ended'); });
+            PV.follow('error', function (e) {
+                journal('player_error', {
+                    session_id: SESSION, playback_id: pb ? pb.id : undefined,
+                    error: String((e && e.error) || '').slice(0, 200)
+                });
+                playbackSummary('error');
+            });
+            PV.follow('destroy', function () { playbackSummary('stop'); });
+        }
+        if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
+            Lampa.Player.listener.follow('destroy', function () { playbackSummary('stop'); });
         }
 
         if (window.MutationObserver && document.body) {
