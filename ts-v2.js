@@ -46,7 +46,7 @@
 
     if (!window.Lampa || !Lampa.Utils) return;
 
-    var VERSION = '2.3';
+    var VERSION = '2.4';
     var DASH = '—';
     var HIDDEN = 'ts-v2-hidden';
 
@@ -262,6 +262,13 @@
 
     // ------------------------------------------- pack / episode classification
 
+    // A RANGE is a pack, a single number is one episode. Ranges are checked first:
+    //   S01E01-E06, S01E01-06, 01x01-06, 1-10 серии из 10
+    var RANGE_RE = /(^|[^a-z0-9])(s\d{1,2}\s*e\d{1,3}\s*[-–—]\s*(e\s*)?\d{1,3}|\d{1,2}x\d{1,3}\s*[-–—]\s*\d{1,3}|(серии|серия|эпизоды)\s*\d{1,3}\s*[-–—]\s*\d{1,3}|\d{1,3}\s*[-–—]\s*\d{1,3}\s*(серии|серий|эпизод\w*)|из\s*\d{1,3})([^a-z0-9]|$)/i;
+
+    // Russian season wording: "1 сезон", "Сезон: 2", "1 сезон: 1-10 серии из 10"
+    var RU_SEASON_RE = /(^|[^a-z0-9])(\d{1,2}\s*сезон|сезон\s*:?\s*\d{1,2})([^a-z0-9]|$)/i;
+
     var EP_RE = /(^|[^a-z0-9])(s\d{1,2}\s*e\d{1,3}|\d{1,2}x\d{1,3}|e\d{1,3}|эп(изод)?\s*\d{1,3}|серия\s*\d{1,3})([^a-z0-9]|$)/i;
     var MULTI_SEASON_RE = /(^|[^a-z0-9])(s\d{1,2}\s*[-–—+]\s*s?\d{1,2}|seasons?\s*\d{1,2}\s*[-–—+]\s*\d{1,2}|сезоны?\s*\d{1,2}\s*[-–—]\s*\d{1,2})([^a-z0-9]|$)/i;
     var COMPLETE_RE = /(^|[^a-z0-9])(complete|全集|全 ?话|полностью|все серии|весь сезон)([^a-z0-9]|$)/i;
@@ -271,10 +278,13 @@
     function classify(title) {
         if (typeof title !== 'string' || !title) return 'E';
         var t = ' ' + title + ' ';
-        if (EP_RE.test(t)) return 'D';                      // S01E05 wins - it is one episode
         if (MULTI_SEASON_RE.test(t)) return 'B';
         if (COMPLETE_RE.test(t)) return 'A';
-        if (SEASON_RE.test(t)) return 'C';
+        // An episode RANGE is a pack, not a single episode - checked before EP_RE
+        // so that "[01x01-06 из 12]" and "1 сезон: 1-10 серии из 10" land in C.
+        if (RANGE_RE.test(t)) return 'C';
+        if (EP_RE.test(t)) return 'D';                      // S01E05 - one episode
+        if (SEASON_RE.test(t) || RU_SEASON_RE.test(t)) return 'C';
         return 'E';
     }
 
@@ -889,55 +899,74 @@
     function newPlayback(extra) {
         playbackId = rnd();
         pb = {
-            id: playbackId, opened_at: Date.now(), first_playing_at: 0,
+            id: playbackId, opened_at: Date.now(), started_at: 0,
             buffering_count: 0, buffering_total: 0, buffering_at: 0,
-            min_ahead: null, last_sample: 0, watch_from: 0
+            min_ahead: null, last_sample: 0, last_buf: 0,
+            position: 0, duration: 0
         };
         if (extra) for (var k in extra) pb[k] = extra[k];
         return pb;
     }
 
-    function videoEl() {
-        try { return document.querySelector ? document.querySelector('video') : null; } catch (e) { return null; }
-    }
-
-    function bufferSample() {
-        if (!pb) return;
-        var v = videoEl();
-        if (!v || !v.duration || isNaN(v.duration)) return;      // native players expose no <video>
-        var end = 0;
-        try {
-            for (var i = 0; i < v.buffered.length; i++) {
-                if (v.buffered.start(i) <= v.currentTime && v.buffered.end(i) > end) end = v.buffered.end(i);
-            }
-        } catch (e) { return; }
-        var ahead = Math.max(0, end - v.currentTime);
-        if (pb.min_ahead === null || ahead < pb.min_ahead) pb.min_ahead = ahead;
-        journal('player_buffer_sample', {
-            session_id: SESSION, playback_id: pb.id,
-            current_time: Math.round(v.currentTime), duration: Math.round(v.duration),
-            buffered_end: Math.round(end), buffer_ahead_seconds: Math.round(ahead),
-            buffer_percent: Math.round(end / v.duration * 100)
-        });
-    }
-
     function playbackSummary(reason) {
         if (!pb) return;
-        var v = videoEl();
-        var watched = pb.first_playing_at ? Math.round((Date.now() - pb.first_playing_at) / 1000) : 0;
+        // Watch time comes from the last confirmed player position, not from how
+        // long the player window was open.
+        var watched = pb.position ? Math.round(pb.position) : null;
         journal('playback_summary', {
             session_id: SESSION, playback_id: pb.id, search_id: searchId, reason: reason,
             total_watch_seconds: watched,
-            time_to_first_playing_ms: pb.first_playing_at ? (pb.first_playing_at - pb.opened_at) : undefined,
+            time_to_playback_started_ms: pb.started_at ? (pb.started_at - pb.opened_at) : undefined,
             buffering_count: pb.buffering_count,
             buffering_total_ms: pb.buffering_total,
             min_buffer_ahead: pb.min_ahead === null ? undefined : Math.round(pb.min_ahead),
-            file_size: pb.file_size, infohash: pb.infohash,
-            duration: v && v.duration ? Math.round(v.duration) : undefined,
-            computed_bitrate_mbps: (pb.file_size && v && v.duration)
-                ? +(pb.file_size * 8 / 1000000 / v.duration).toFixed(2) : undefined
+            file_size: pb.file_size,
+            torrent_infohash: pb.infohash,
+            parser_result_id: pb.parser_result_id,
+            duration: pb.duration || undefined,
+            last_position: pb.position || undefined,
+            max_buffer_percent: pb.max_buf === undefined ? undefined : pb.max_buf,
+            external_player: pb.external || undefined,
+            buffering_note: 'waiting/stalled is not re-emitted on PlayerVideo.listener in this Lampa build, so rebuffering cannot be measured yet',
+            computed_bitrate_mbps: (pb.file_size && pb.duration)
+                ? +(pb.file_size * 8 / 1000000 / pb.duration).toFixed(2) : undefined
         });
         pb = null;
+    }
+
+    // ---- canonical TorrServer hash -----------------------------------------
+    //
+    // Torserver.add() posts the magnet and TorrServer answers with the real
+    // infohash. That is the only identifier the collector can look up; the
+    // parser's own id is not a BTIH and must never be used as one.
+
+    var BTIH_RE = /^[0-9a-f]{40}$/i;
+
+    if (Lampa.Torserver && Lampa.Torserver.add && !Lampa.Torserver.__ts_v24) {
+        var stockAdd = Lampa.Torserver.add;
+
+        Lampa.Torserver.add = function (object, success, fail) {
+            var wrapped = function (json) {
+                try {
+                    var h = json && json.hash ? String(json.hash) : '';
+                    // Store it only if it really is a BTIH - a later invalid value
+                    // must never overwrite a good one.
+                    if (pb && BTIH_RE.test(h)) pb.infohash = h.toLowerCase();
+                    journal('torrent_identity_resolved', {
+                        session_id: SESSION, search_id: searchId,
+                        playback_id: pb ? pb.id : playbackId,
+                        parser_result_id: pb ? pb.parser_result_id : undefined,
+                        torrent_infohash: h || undefined,
+                        infohash_valid: BTIH_RE.test(h),
+                        title: String((object && object.title) || '').slice(0, 180)
+                    });
+                } catch (e) {}
+                if (success) return success.apply(this, arguments);
+            };
+            return stockAdd.call(Lampa.Torserver, object, wrapped, fail);
+        };
+
+        Lampa.Torserver.__ts_v24 = true;
     }
 
     try {
@@ -987,13 +1016,15 @@
                         var it = e.element;
                         var tr = inferTracks(it.Title || '');
                         newPlayback({
-                            infohash: it.Hash || it.hash || undefined,
+                            parser_result_id: it.Hash || it.hash || undefined,
                             file_size: isFinite(parseFloat(it.Size)) ? parseFloat(it.Size) : undefined
                         });
                         journal('torrent_selected', {
                             session_id: SESSION, search_id: searchId, playback_id: playbackId,
                             title: String(it.Title || '').slice(0, 180),
-                            source: it.Tracker, infohash: it.Hash || it.hash || undefined,
+                            // JacRed returns a short numeric id here, NOT a BitTorrent
+                            // infohash. The canonical hash arrives later from TorrServer.
+                            source: it.Tracker, parser_result_id: it.Hash || it.hash || undefined,
                             size_bytes: isFinite(parseFloat(it.Size)) ? parseFloat(it.Size) : undefined,
                             size_raw: it.size, seeders: it.Seeders, peers: it.Peers,
                             pack_class: classify(it.Title || ''),
@@ -1025,43 +1056,78 @@
             });
         }
 
-        // player: real HTML5 semantics, documented per event
+        // ---- player -------------------------------------------------------
+        //
+        // Verified against the live bundle: PlayerVideo re-emits ONLY these of the
+        // underlying video events onto its public listener -
+        //   ended, error, progress {down}, canplay, timeupdate {duration,current},
+        //   loadeddata -> videosize
+        // "playing" and "waiting" stay on the backend's internal listener and are
+        // NOT reachable, which is exactly why v2.3 saw canplay but never playing.
+        // So playback start is derived from the first timeupdate with a position,
+        // the buffer bar from progress, and rebuffering is left unmeasured rather
+        // than invented.
+
         var PV = Lampa.PlayerVideo && Lampa.PlayerVideo.listener;
+
         if (PV && PV.follow) {
             PV.follow('canplay', function () {
                 if (!pb) newPlayback({});
                 if (!pb.opened_logged) {
                     pb.opened_logged = true;
-                    journal('player_open', { session_id: SESSION, playback_id: pb.id, search_id: searchId, on: 'canplay' });
-                }
-            });
-            PV.follow('playing', function () {
-                if (!pb) return;
-                if (!pb.first_playing_at) {
-                    pb.first_playing_at = Date.now();
-                    journal('first_playing', {
-                        session_id: SESSION, playback_id: pb.id,
-                        elapsed_ms: pb.first_playing_at - pb.opened_at,
-                        semantic: 'HTML5 video "playing" event - playback actually started, not a decoded first frame'
+                    journal('player_open', {
+                        session_id: SESSION, playback_id: pb.id, search_id: searchId,
+                        on: 'canplay', elapsed_ms: Date.now() - pb.opened_at
                     });
-                } else if (pb.buffering_at) {
-                    var d = Date.now() - pb.buffering_at;
-                    pb.buffering_at = 0; pb.buffering_total += d;
-                    journal('buffering_end', { session_id: SESSION, playback_id: pb.id, duration_ms: d });
                 }
             });
-            PV.follow('waiting', function () {
-                if (!pb || !pb.first_playing_at || pb.buffering_at) return;   // initial load is not rebuffering
-                pb.buffering_at = Date.now(); pb.buffering_count++;
-                journal('buffering_start', { session_id: SESSION, playback_id: pb.id });
-            });
-            PV.follow('timeupdate', function () {
+
+            PV.follow('timeupdate', function (e) {
                 if (!pb) return;
+                var cur = e && typeof e.current === 'number' ? e.current : null;
+                var dur = e && typeof e.duration === 'number' ? e.duration : null;
+                if (dur) pb.duration = dur;
+                if (cur !== null) pb.position = cur;
+
+                if (!pb.started_at && cur !== null && cur > 0) {
+                    pb.started_at = Date.now();
+                    journal('playback_started', {
+                        session_id: SESSION, playback_id: pb.id,
+                        elapsed_ms: pb.started_at - pb.opened_at,
+                        position: Math.round(cur),
+                        duration: dur ? Math.round(dur) : undefined,
+                        semantic: 'first timeupdate with position > 0 - playback is advancing; not a decoded first frame'
+                    });
+                }
+
                 var now = Date.now();
-                if (now - pb.last_sample < 5000) return;                      // at most once per 5 s
+                if (now - pb.last_sample < 5000) return;
                 pb.last_sample = now;
-                bufferSample();
+                journal('playback_position_sample', {
+                    session_id: SESSION, playback_id: pb.id,
+                    current_time: cur === null ? undefined : Math.round(cur),
+                    duration: dur ? Math.round(dur) : undefined
+                });
             });
+
+            // The second bar in the player: how much of the file the player holds.
+            PV.follow('progress', function (e) {
+                if (!pb) return;
+                var pct = parseFloat(e && e.down ? String(e.down) : '');
+                if (!isFinite(pct)) return;
+                if (pb.max_buf === undefined || pct > pb.max_buf) pb.max_buf = pct;
+                var now = Date.now();
+                if (now - pb.last_buf < 5000) return;
+                pb.last_buf = now;
+                journal('player_buffer_sample', {
+                    session_id: SESSION, playback_id: pb.id,
+                    buffer_percent: pct,
+                    current_time: pb.position ? Math.round(pb.position) : undefined,
+                    duration: pb.duration ? Math.round(pb.duration) : undefined,
+                    source: 'PlayerVideo progress event'
+                });
+            });
+
             PV.follow('ended', function () { playbackSummary('ended'); });
             PV.follow('error', function (e) {
                 journal('player_error', {
@@ -1070,11 +1136,70 @@
                 });
                 playbackSummary('error');
             });
-            PV.follow('destroy', function () { playbackSummary('stop'); });
         }
+
         if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
+            Lampa.Player.listener.follow('external', function () {
+                if (pb) pb.external = true;
+                journal('player_external', {
+                    session_id: SESSION, playback_id: pb ? pb.id : undefined,
+                    note: 'playback handed to an external player - Lampa emits no position events'
+                });
+            });
             Lampa.Player.listener.follow('destroy', function () { playbackSummary('stop'); });
         }
+
+        // ---- bounded diagnostic tracer (v2.4 control run only) --------------
+        //
+        // Records WHICH player channels actually fire on this device, so the next
+        // version can stop guessing. Field names only, a few safe primitives, hard
+        // caps so the journal cannot be flooded.
+
+        var DIAG_MAX = 100;
+        var DIAG_CHANNELS = ['canplay', 'playing', 'waiting', 'stalled', 'timeupdate', 'progress',
+                             'loadeddata', 'videosize', 'ended', 'error', 'rewind', 'destroy',
+                             'subtitle', 'start', 'ready', 'create', 'external'];
+
+        function traceOn(bus, busName) {
+            if (!bus || !bus.follow) return;
+            for (var i = 0; i < DIAG_CHANNELS.length; i++) {
+                (function (name) {
+                    bus.follow(name, function (e) {
+                        try {
+                            if (!pb) return;
+                            if (pb.diag_n === undefined) { pb.diag_n = 0; pb.diag_last = {}; }
+                            if (pb.diag_n >= DIAG_MAX) return;
+                            var now = Date.now();
+                            if (pb.diag_last[name] && now - pb.diag_last[name] < 1000) return;
+                            pb.diag_last[name] = now;
+                            pb.diag_n++;
+
+                            var keys = [], prim = {};
+                            if (e && typeof e === 'object') {
+                                for (var k in e) {
+                                    if (keys.length >= 12) break;
+                                    keys.push(k);
+                                    var val = e[k], t = typeof val;
+                                    if (keys.length <= 6) {
+                                        if (t === 'number' || t === 'boolean') prim[k] = val;
+                                        else if (t === 'string' && val.length <= 12) prim[k] = val;
+                                    }
+                                }
+                            }
+                            journal('player_diag_event', {
+                                session_id: SESSION, playback_id: pb.id,
+                                bus: busName, event_name: name,
+                                elapsed_ms: now - pb.opened_at,
+                                payload_keys: keys, payload_primitives: prim, n: pb.diag_n
+                            });
+                        } catch (err) {}
+                    });
+                })(DIAG_CHANNELS[i]);
+            }
+        }
+
+        traceOn(PV, 'PlayerVideo');
+        traceOn(Lampa.Player && Lampa.Player.listener, 'Player');
 
         if (window.MutationObserver && document.body) {
             new window.MutationObserver(function () { hideShots(); })
