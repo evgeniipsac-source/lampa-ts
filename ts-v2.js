@@ -46,9 +46,97 @@
 
     if (!window.Lampa || !Lampa.Utils) return;
 
-    var VERSION = '2.1';
+    var VERSION = '2.2';
     var DASH = '—';
     var HIDDEN = 'ts-v2-hidden';
+
+    // ------------------------------------------------------------- journal
+
+    // Local-only. The collector runs on the same LAN PC and writes JSONL.
+    // Nothing is sent anywhere else. If the collector is unreachable the queue
+    // is capped and the UI is never blocked or slowed.
+    var JOURNAL_URL = 'http://192.168.31.175:8091/event';
+    var QUEUE_KEY = 'ts_journal_queue';
+    var QUEUE_MAX = 500;
+
+    var jq = [];
+    var jSending = false;
+    var jOffline = 0;
+
+    // Storage.get normally returns a parsed value, but be defensive: a string
+    // slipping through here would corrupt the queue.
+    function jParse(raw, fallback) {
+        if (typeof raw === 'string') {
+            try { raw = JSON.parse(raw); } catch (e) { return fallback; }
+        }
+        return raw || fallback;
+    }
+
+    function jLoad() {
+        try {
+            var raw = jParse(Lampa.Storage.get(QUEUE_KEY, '[]'), []);
+            if (raw && raw.length) jq = raw.slice(0, QUEUE_MAX);
+        } catch (e) { jq = []; }
+    }
+
+    function jSave() {
+        try { Lampa.Storage.set(QUEUE_KEY, jq.slice(-QUEUE_MAX)); } catch (e) {}
+    }
+
+    function jFlush() {
+        if (jSending || !jq.length) return;
+        if (jOffline && Date.now() < jOffline) return;      // back off while down
+        jSending = true;
+
+        var batch = jq.slice(0, 50);
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', JOURNAL_URL, true);
+            xhr.timeout = 4000;
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.onload = function () {
+                jSending = false;
+                if (xhr.status === 200) {
+                    jq = jq.slice(batch.length);
+                    jOffline = 0;
+                    jSave();
+                    if (jq.length) setTimeout(jFlush, 50);
+                } else {
+                    jOffline = Date.now() + 60000;
+                }
+            };
+            xhr.onerror = xhr.ontimeout = function () {
+                jSending = false;
+                jOffline = Date.now() + 60000;              // retry in a minute
+            };
+            xhr.send(JSON.stringify(batch));
+        } catch (e) {
+            jSending = false;
+            jOffline = Date.now() + 60000;
+        }
+    }
+
+    function isoNow() {
+        var d = new Date();
+        if (d.toISOString) { try { return d.toISOString(); } catch (e) {} }
+        function p(n, w) { var s = String(n); while (s.length < (w || 2)) s = '0' + s; return s; }
+        return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) +
+               'T' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds()) +
+               '.' + p(d.getUTCMilliseconds(), 3) + 'Z';
+    }
+
+    function journal(event, data) {
+        try {
+            var ev = data || {};
+            ev.event = event;
+            ev.v = VERSION;
+            ev.ts_client = isoNow();
+            jq.push(ev);
+            if (jq.length > QUEUE_MAX) jq = jq.slice(-QUEUE_MAX);
+            jSave();
+            jFlush();
+        } catch (e) {}
+    }
 
     // ============================================================ size utilities
 
@@ -171,6 +259,80 @@
         ')([^A-Za-z0-9А-я]|$)', 'i');
 
     function isPack(t) { return typeof t === 'string' && PACK_RE.test(t); }
+
+    // ------------------------------------------- pack / episode classification
+
+    var EP_RE = /(^|[^a-z0-9])(s\d{1,2}\s*e\d{1,3}|\d{1,2}x\d{1,3}|e\d{1,3}|эп(изод)?\s*\d{1,3}|серия\s*\d{1,3})([^a-z0-9]|$)/i;
+    var MULTI_SEASON_RE = /(^|[^a-z0-9])(s\d{1,2}\s*[-–—+]\s*s?\d{1,2}|seasons?\s*\d{1,2}\s*[-–—+]\s*\d{1,2}|сезоны?\s*\d{1,2}\s*[-–—]\s*\d{1,2})([^a-z0-9]|$)/i;
+    var COMPLETE_RE = /(^|[^a-z0-9])(complete|全集|全 ?话|полностью|все серии|весь сезон)([^a-z0-9]|$)/i;
+    var SEASON_RE = /(^|[^a-z0-9])(s\d{1,2}(?!\s*e\s*\d)|seasons?[\s._-]*\d{1,2}|сезон[\s._-]*\d{1,2}|batch)([^a-z0-9]|$)/i;
+
+    // A: complete series, B: multi-season, C: season pack, D: single episode, E: other
+    function classify(title) {
+        if (typeof title !== 'string' || !title) return 'E';
+        var t = ' ' + title + ' ';
+        if (EP_RE.test(t)) return 'D';                      // S01E05 wins - it is one episode
+        if (MULTI_SEASON_RE.test(t)) return 'B';
+        if (COMPLETE_RE.test(t)) return 'A';
+        if (SEASON_RE.test(t)) return 'C';
+        return 'E';
+    }
+
+    var CLASS_RANK = { 'A': 0, 'B': 1, 'C': 2, 'E': 3, 'D': 4 };   // packs first, episodes last
+
+    // --------------------------------------------- inferred audio / subtitles
+
+    // Only confident, explicit markers. Anything unrecognised stays unknown and
+    // is never filtered out.
+    var LANG_RE = [
+        ['RUS', /(^|[^a-z])(rus|ru|russian|многоголос|дубляж|дублирован|русск)([^a-z]|$)/i],
+        ['ENG', /(^|[^a-z])(eng|en|english)([^a-z]|$)/i],
+        ['ITA', /(^|[^a-z])(ita|italian)([^a-z]|$)/i],
+        ['JPN', /(^|[^a-z])(jpn|jap|japanese|яп)([^a-z]|$)/i],
+        ['UKR', /(^|[^a-z])(ukr|ukrainian|укр)([^a-z]|$)/i],
+        ['GER', /(^|[^a-z])(ger|deu|german)([^a-z]|$)/i],
+        ['FRA', /(^|[^a-z])(fra|fre|french)([^a-z]|$)/i],
+        ['SPA', /(^|[^a-z])(spa|esp|spanish)([^a-z]|$)/i],
+        ['KOR', /(^|[^a-z])(kor|korean)([^a-z]|$)/i],
+        ['CHI', /(^|[^a-z])(chi|chs|cht|chinese)([^a-z]|$)/i]
+    ];
+
+    var DUB_RE = [
+        ['DUB', /(^|[^a-z])(dub|дубляж|дублирован)([^a-z]|$)/i],
+        ['MVO', /(^|[^a-z])(mvo|многоголос)([^a-z]|$)/i],
+        ['DVO', /(^|[^a-z])(dvo|двухголос)([^a-z]|$)/i],
+        ['AVO', /(^|[^a-z])(avo|авторск)([^a-z]|$)/i],
+        ['VO',  /(^|[^a-z])(vo|voice ?over|озвуч)([^a-z]|$)/i],
+        ['ORIG',/(^|[^a-z])(original ?audio|orig)([^a-z]|$)/i]
+    ];
+
+    var MULTI_RE = /(^|[^a-z])(multi|dual|multilang)([^a-z]|$)/i;
+    // the subtitle part of a release name, e.g. "... AAC Sub ita eng"
+    var SUB_TAIL_RE = /(sub(s|title|titles)?|суб(титры)?)[\s._:-]*([a-zа-я ,._\/+-]{0,40})/i;
+
+    function inferTracks(title) {
+        var out = { audio: [], subs: [], dub: [], multi: false };
+        if (typeof title !== 'string' || !title) return out;
+
+        var subM = title.match(SUB_TAIL_RE);
+        var subPart = subM ? subM[0] : '';
+        var audioPart = subPart ? title.replace(subPart, ' ') : title;
+
+        for (var i = 0; i < LANG_RE.length; i++) {
+            if (LANG_RE[i][1].test(audioPart)) out.audio.push(LANG_RE[i][0]);
+        }
+        if (subPart) {
+            for (var j = 0; j < LANG_RE.length; j++) {
+                if (LANG_RE[j][1].test(subPart)) out.subs.push(LANG_RE[j][0]);
+            }
+            if (!out.subs.length) out.subs.push('?');       // subs present, language unclear
+        }
+        for (var d = 0; d < DUB_RE.length; d++) {
+            if (DUB_RE[d][1].test(title)) out.dub.push(DUB_RE[d][0]);
+        }
+        out.multi = MULTI_RE.test(title);
+        return out;
+    }
 
     // Structural markers that separate the show name from the episode part:
     // S01, S01E05, S6E11, 1x05, Season 1, Сезон 2.
@@ -412,11 +574,42 @@
                 }
 
                 reject = !relevant(vars.Title || vars.title, movie);
+
+                // Inferred audio / subtitles / pack class, appended to the
+                // tracker line so nothing in the layout has to move.
+                try {
+                    var title = vars.Title || vars.title || '';
+                    var cls = classify(title);
+                    var tr = inferTracks(title);
+                    var bits = [];
+
+                    if (cls === 'A') bits.push('COMPLETE');
+                    else if (cls === 'B') bits.push('MULTI-SEASON');
+                    else if (cls === 'C') bits.push('SEASON');
+
+                    var ver = verified(vars.Hash || vars.hash);
+                    var au = ver ? ver.audio : tr.audio;
+                    var su = ver ? ver.subs : tr.subs;
+                    var mark = ver ? '✓' : '';          // check mark = verified
+
+                    if (au && au.length) bits.push(mark + 'A: ' + au.join(' · '));
+                    else if (tr.multi) bits.push('A: MULTI');
+                    if (tr.dub.length && !ver) bits.push(tr.dub.join(' '));
+                    if (su && su.length) bits.push(mark + 'S: ' + su.join(' · '));
+
+                    if (bits.length) {
+                        vars.tracker = (vars.tracker || vars.Tracker || '') + '  •  ' + bits.join('  •  ');
+                    }
+                    vars.__ts_class = cls;
+                } catch (e) {}
             }
 
             var res = stockGet.apply(Lampa.Template, arguments);
 
-            if (reject && res && typeof res !== 'string' && res.addClass) res.addClass(HIDDEN);
+            if (name === 'torrent' && res && typeof res !== 'string' && res.addClass) {
+                if (reject) res.addClass(HIDDEN);
+                else if (vars && vars.__ts_class) res.addClass('ts-cls-' + vars.__ts_class);
+            }
             return res;
         };
 
@@ -431,10 +624,25 @@
         Lampa.Activity.push = function (params) {
             try {
                 if (params && params.component === 'torrents' && params.search && params.movie) {
+                    var requested = params.search;
+                    var reason = '';
                     if (latinShare(params.search) < 0.4) {
                         var alias = latinAlias(params.movie);
-                        if (alias) params.search = alias;
+                        if (alias) { params.search = alias; reason = 'non_latin_to_latin_alias'; }
+                        else reason = 'non_latin_no_alias_found';
                     }
+                    var mv = params.movie;
+                    journal('torrent_search_start', {
+                        id: mv.id,
+                        media_type: mv.number_of_seasons ? 'tv' : 'movie',
+                        requested_query: requested,
+                        actual_query: params.search,
+                        rewrite_reason: reason,
+                        original_language: mv.original_language,
+                        year: (mv.release_date || mv.first_air_date || '').slice(0, 4),
+                        season: params.season || null,
+                        episode: params.episode || null
+                    });
                 }
             } catch (e) {}
             return stockPush.apply(Lampa.Activity, arguments);
@@ -518,9 +726,89 @@
         }
     }
 
+    // =========================================== verified track cache (Phase 3.4)
+
+    var VER_KEY = 'ts_verified_tracks';
+    var verCache = null;
+
+    function verified(hash) {
+        if (!hash) return null;
+        if (verCache === null) {
+            try { verCache = jParse(Lampa.Storage.get(VER_KEY, '{}'), {}); } catch (e) { verCache = {}; }
+        }
+        return verCache[String(hash).toLowerCase()] || null;
+    }
+
+    function rememberTracks(hash, audio, subs) {
+        if (!hash) return;
+        try {
+            if (verCache === null) verCache = jParse(Lampa.Storage.get(VER_KEY, '{}'), {});
+            var keys = [];
+            for (var k in verCache) keys.push(k);
+            if (keys.length > 300) delete verCache[keys[0]];        // bounded
+            verCache[String(hash).toLowerCase()] = { audio: audio, subs: subs };
+            Lampa.Storage.set(VER_KEY, verCache);
+            journal('tracks_verified', { infohash: hash, audio: audio, subs: subs });
+        } catch (e) {}
+    }
+
+    // ================================================= Shots row on the home page
+
+    function hideShots() {
+        try {
+            var lines = document.querySelectorAll('.items-line');
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+                if (line.__ts_shots) continue;
+                var t = line.querySelector('.items-line__title');
+                if (!t) continue;
+                var name = (t.textContent || '').trim().toLowerCase();
+                if (name === 'shots' || name === 'шортсы' || name === 'шорты') {
+                    line.__ts_shots = true;
+                    line.classList.add(HIDDEN);
+                    journal('shots_hidden', { title: t.textContent });
+                }
+            }
+        } catch (e) {}
+    }
+
+    // ================================================================ journal taps
+
+    try {
+        jLoad();
+
+        journal('app_start', { plugin_version: VERSION });
+
+        if (Lampa.Listener && Lampa.Listener.follow) {
+            Lampa.Listener.follow('full', function (e) {
+                if (e && e.type === 'complite' && e.data && e.data.movie) {
+                    var m = e.data.movie;
+                    journal('card_open', {
+                        id: m.id,
+                        media_type: m.number_of_seasons ? 'tv' : 'movie',
+                        title: m.title || m.name,
+                        original_title: m.original_title || m.original_name,
+                        original_language: m.original_language,
+                        year: (m.release_date || m.first_air_date || '').slice(0, 4),
+                        runtime: m.runtime || 0
+                    });
+                }
+            });
+
+            Lampa.Listener.follow('activity', function () { setTimeout(hideShots, 300); });
+        }
+
+        if (window.MutationObserver && document.body) {
+            new window.MutationObserver(function () { hideShots(); })
+                .observe(document.body, { childList: true, subtree: true });
+        }
+        hideShots();
+    } catch (e) {}
+
     // Version marker - no telemetry, just something to read off the console.
     try {
         window.__lampa_torrfix_version = VERSION;
+        window.__lampa_torrfix = { journal: journal, classify: classify, inferTracks: inferTracks, rememberTracks: rememberTracks };
         if (window.console && console.log) console.log('[Lampa TorrFix] v' + VERSION + ' loaded');
     } catch (e) {}
 })();
