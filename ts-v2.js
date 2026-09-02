@@ -46,7 +46,7 @@
 
     if (!window.Lampa || !Lampa.Utils) return;
 
-    var VERSION = '2.4';
+    var VERSION = '2.5';
     var DASH = '—';
     var HIDDEN = 'ts-v2-hidden';
 
@@ -936,42 +936,75 @@
 
     // ---- canonical TorrServer hash -----------------------------------------
     //
-    // Torserver.add() posts the magnet and TorrServer answers with the real
-    // infohash. That is the only identifier the collector can look up; the
-    // parser's own id is not a BTIH and must never be used as one.
+    // v2.4 wrapped Torserver.add() and never fired once on a real TV run. The
+    // bundle exposes two distinct functions and only one of them is on the
+    // playback path:
+    //
+    //   add$e  -> Torserver.add   save_to_db: true, sole call site addToBase()
+    //                             i.e. "add to my torrents", not playback
+    //   hash$1 -> Torserver.hash  "Добавляет торрент на сервер с проверкой хэша",
+    //                             sole call site is the torrent component:
+    //                                 Torserver.hash({...}, function (json) {
+    //                                     SERVER.hash = json.hash; files();
+    //                                 }, ...)
+    //
+    // So json.hash from Torserver.hash is the real TorrServer BTIH, and the only
+    // identifier the collector can look up. The parser's own id (JacRed answers
+    // with a short decimal) is not a BTIH and must never be used as one.
 
     var BTIH_RE = /^[0-9a-f]{40}$/i;
+    var hashHook = 'absent';
 
-    if (Lampa.Torserver && Lampa.Torserver.add && !Lampa.Torserver.__ts_v24) {
-        var stockAdd = Lampa.Torserver.add;
+    if (Lampa.Torserver && typeof Lampa.Torserver.hash === 'function' && !Lampa.Torserver.__ts_v25) {
+        var stockHash = Lampa.Torserver.hash;
 
-        Lampa.Torserver.add = function (object, success, fail) {
+        Lampa.Torserver.hash = function (object, success, fail) {
+            // Correlation: bind to the playback context that exists NOW, when the
+            // request is issued - Lampa calls this synchronously after the
+            // selection that created `pb`. Reading the module-level `pb` inside
+            // the callback instead would let a second selection made while the
+            // first request is still in flight steal the first one's hash.
+            var ctx = pb;
+            var ctxSearch = searchId;
+            var ctxId = pb ? pb.id : playbackId;
+
             var wrapped = function (json) {
                 try {
                     var h = json && json.hash ? String(json.hash) : '';
-                    // Store it only if it really is a BTIH - a later invalid value
-                    // must never overwrite a good one.
-                    if (pb && BTIH_RE.test(h)) pb.infohash = h.toLowerCase();
-                    journal('torrent_identity_resolved', {
-                        session_id: SESSION, search_id: searchId,
-                        playback_id: pb ? pb.id : playbackId,
-                        parser_result_id: pb ? pb.parser_result_id : undefined,
-                        torrent_infohash: h || undefined,
-                        infohash_valid: BTIH_RE.test(h),
-                        title: String((object && object.title) || '').slice(0, 180)
-                    });
+                    if (BTIH_RE.test(h)) {
+                        // Assign only on a real BTIH, so a later invalid value can
+                        // never overwrite a good one.
+                        if (ctx) ctx.infohash = h.toLowerCase();
+                        journal('torrent_identity_resolved', {
+                            session_id: SESSION, search_id: ctxSearch, playback_id: ctxId,
+                            parser_result_id: ctx ? ctx.parser_result_id : undefined,
+                            torrent_infohash: h.toLowerCase(),
+                            infohash_valid: true,
+                            title: String((object && object.title) || '').slice(0, 180)
+                        });
+                    } else {
+                        // No fallback is invented here. Without a real BTIH there
+                        // is nothing to look up, and we say so. The value itself is
+                        // not logged.
+                        journal('torrent_identity_failed', {
+                            session_id: SESSION, search_id: ctxSearch, playback_id: ctxId,
+                            reason: h ? 'not_a_40hex_infohash' : 'no_hash_in_response'
+                        });
+                    }
                 } catch (e) {}
                 if (success) return success.apply(this, arguments);
             };
-            return stockAdd.call(Lampa.Torserver, object, wrapped, fail);
+
+            return stockHash.call(this, object, wrapped, fail);
         };
 
-        Lampa.Torserver.__ts_v24 = true;
+        Lampa.Torserver.__ts_v25 = true;
+        hashHook = 'installed';
     }
 
     try {
         jLoad();
-        journal('app_start', { session_id: SESSION, plugin_version: VERSION });
+        journal('app_start', { session_id: SESSION, plugin_version: VERSION, hash_hook: hashHook });
 
         var L = Lampa.Listener;
 
