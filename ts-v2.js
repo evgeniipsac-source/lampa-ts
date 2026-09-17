@@ -46,7 +46,7 @@
 
     if (!window.Lampa || !Lampa.Utils) return;
 
-    var VERSION = '2.5';
+    var VERSION = '2.6';
     var DASH = '—';
     var HIDDEN = 'ts-v2-hidden';
 
@@ -55,7 +55,23 @@
     // Local-only. The collector runs on the same LAN PC and writes JSONL.
     // Nothing is sent anywhere else. If the collector is unreachable the queue
     // is capped and the UI is never blocked or slowed.
-    var JOURNAL_URL = 'http://192.168.31.175:8091/event';
+    var JOURNAL_FALLBACK = 'http://192.168.31.175:8091/event';
+    var JOURNAL_PORT = 8091;
+
+    // The journal collector runs on the same machine as TorrServer, so the host
+    // is whatever TorrServer host Lampa is pointed at. Deriving it keeps
+    // telemetry working on whichever network the TV has joined - the router LAN
+    // or the Ytap hotspot - without republishing this file when that changes.
+    function journalUrl() {
+        try {
+            var key = Lampa.Storage.field('torrserver_use_link') === 'two'
+                ? 'torrserver_url_two' : 'torrserver_url';
+            var tu = String(Lampa.Storage.field(key) || '');
+            var m = tu.match(/^https?:\/\/([^\/?#:]+)/i);
+            if (m && m[1]) return 'http://' + m[1] + ':' + JOURNAL_PORT + '/event';
+        } catch (e) {}
+        return JOURNAL_FALLBACK;
+    }
     var QUEUE_KEY = 'ts_journal_queue';
     var QUEUE_MAX = 500;
 
@@ -91,7 +107,7 @@
         var batch = jq.slice(0, 50);
         try {
             var xhr = new XMLHttpRequest();
-            xhr.open('POST', JOURNAL_URL, true);
+            xhr.open('POST', journalUrl(), true);
             xhr.timeout = 4000;
             xhr.setRequestHeader('Content-Type', 'application/json');
             xhr.onload = function () {
